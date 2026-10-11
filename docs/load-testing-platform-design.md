@@ -1,6 +1,6 @@
 # Distributed Load Testing Platform: Design Document
 
-**Status:** Draft v0.1
+**Status:** Draft v0.2 (Phase 1 complete)
 **Author:** Anshul
 **Goal:** Learn system design by building a small distributed load generator with coordination, scaling, and metrics aggregation.
 
@@ -144,6 +144,8 @@ Percentiles cannot be averaged. The p99 of combined data is not the mean of each
 
 **Tradeoff:** Requires measuring per-worker capacity up front. A purely reactive CPU-based scaler is simpler but reacts late and is less predictable.
 
+**Phase 1 finding (hypothesis to test in Phase 5):** In single-worker runs, the generator's *schedule lag* (how far behind its intended send times it is) rose before results visibly broke: 0, 12, and 26 ms at 50, 100, and 150 RPS, then over 2 seconds at 200 RPS. Per-worker schedule lag may therefore be a better leading indicator of saturation than CPU. Candidate rule: scale up when a worker's max lag crosses a threshold. This is untested beyond the single-worker sweep.
+
 ### 8.4 Redis as the single coordination layer
 **Decision:** Use Redis for registry, commands, and metrics.
 
@@ -178,11 +180,30 @@ Things to measure and document during development:
 
 Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 
+### Measured findings (Phase 1, 2026-10-11)
+
+**Environment:** Windows laptop, Python venv, httpx client, target on the same machine (shared CPU), target at 50 ms nominal latency, 0% errors.
+
+| Target RPS | Achieved send RPS | Max schedule lag | p50 latency | Valid? |
+|-----------|-------------------|------------------|-------------|--------|
+| 50 | 50.1 | 0 ms | 69 ms | Yes |
+| 100 | 100.1 | 12 ms | 67 ms | Yes |
+| 150 | 150.0 | 26 ms | 66 ms | Yes |
+| 200 | 165.3 | 2,097 ms | 704 ms | No (generator behind) |
+
+- **Single-worker ceiling:** roughly 150 RPS clean, failing by 200 (httpx, Windows, shared CPU). Provisional planning value: about 120 RPS per worker (~80% of the ceiling). To be revisited once workers run in containers with CPU limits.
+- **Cliff, not slope:** lag stayed small, then jumped by two orders of magnitude between 150 and 200 RPS. A plausible mechanism is a feedback loop (falling behind causes bursts of overdue requests, bursts cost CPU, which causes more lag). Not confirmed.
+- **Windows `localhost` pitfall:** using `localhost` instead of `127.0.0.1` cut achieved RPS at the 200 RPS target from 165 to 109 and raised max lag from 2.1 s to 8.3 s. Probable cause is IPv6-first name resolution against an IPv4-only server. Not directly verified.
+- **Why latency was measured from intended send time:** in the failing runs, reported latency (hundreds of ms to seconds) was mostly schedule lag plus delayed response processing in the overloaded event loop, not target latency. A closed-loop generator would have hidden this. Max latency exceeded max lag, so the busy event loop also delays *reading* responses.
+- **Baseline latency offset:** p50 was ~67 ms against a 50 ms nominal target and stayed flat across load levels. The cause is unexplained; one hypothesis is Windows timer granularity in the target's `asyncio.sleep`. Unverified.
+- **Target is a single process:** at higher aggregate RPS it will saturate too, so later results must distinguish generator saturation from target saturation.
+- **Not yet tested:** aiohttp vs. httpx, Windows selector event loop, per-process CPU usage during saturation.
+
 ## 11. Implementation Plan
 
 | Phase | Deliverable | Est. time |
 |-------|-------------|-----------|
-| 1 | Single open-loop async load generator with latency recording | 2-3 days |
+| 1 (done) | Single open-loop async load generator with latency recording | 2-3 days |
 | 2 | Dockerize generator; build target service with tunable latency/errors/capacity | 1-2 days |
 | 3 | Coordinator + multiple workers: registry, heartbeats, assignments, synchronized start | 3-4 days |
 | 4 | Histogram-based metric aggregation and live global percentiles | 2-3 days |
@@ -207,10 +228,10 @@ Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 ## 13. Validation Plan
 
 - **Correctness of percentiles:** Compare merged-histogram p99 against p99 computed from raw latency logs on a small run.
-- **Open-loop check:** Slow the target deliberately; confirm the generated RPS stays constant and reported latency rises.
+- **Open-loop check:** Slow the target deliberately; confirm the generated RPS stays constant and reported latency rises. *(Status: not yet run.)*
 - **Scaling test:** Ramp from 100 to 5,000+ RPS and verify the worker count follows the target.
 - **Chaos test:** Kill 1, then 2 workers mid-run; verify detection time and recovery behavior.
-- **Saturation test:** Push one worker past its ceiling; verify the "generator saturated" flag fires.
+- **Saturation test:** Push one worker past its ceiling; verify the "generator saturated" flag fires. *(Status: done for a single worker on 2026-10-11. The warning fired at 200 RPS; see Section 10.)*
 
 ## 14. Demo Scenario
 
@@ -223,7 +244,11 @@ Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 
 ## 15. Open Questions
 
-- What per-worker RPS ceiling is realistic with httpx vs. aiohttp?
+- What per-worker RPS ceiling is realistic with aiohttp vs. httpx? (httpx measured at roughly 150 RPS clean on Windows with shared CPU; aiohttp not yet tested.)
+- Is the feedback-loop explanation for the cliff between 150 and 200 RPS correct, and where exactly is the ceiling?
+- Is the ~17 ms of extra baseline latency (p50 ~67 ms vs. 50 ms nominal) caused by Windows timer granularity?
+- Will per-worker schedule lag work as a leading autoscaling signal, and at what threshold?
+- How will container CPU limits change the per-worker ceiling?
 - Fixed-bucket histogram vs. HdrHistogram vs. t-digest for the metric payload?
 - Should the autoscaler live inside the coordinator or run as its own service?
 - How should ramp profiles interact with scaling lead time (containers take seconds to start)?
@@ -236,6 +261,15 @@ Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 - Designing Data-Intensive Applications (Kleppmann): chapters on replication, partitioning, and stream processing
 - Docker SDK for Python documentation
 - Redis Streams documentation
+
+---
+
+## Revision History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v0.1 | 2026-10-09 | Initial design |
+| v0.2 | 2026-10-11 | Phase 1 complete. Added measured single-worker findings (Section 10), schedule-lag scaling hypothesis (Section 8.3), validation status (Section 13), and updated open questions (Section 15) |
 
 ---
 
