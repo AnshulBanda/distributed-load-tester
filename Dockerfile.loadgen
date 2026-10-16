@@ -1,0 +1,19 @@
+# Dockerfile.loadgen - builds the image for the load generator.
+
+FROM python:3.12-slim
+
+# Print output immediately instead of buffering it, so you see results
+# right away when running in a container.
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY loadgen.py .
+
+# ENTRYPOINT is the fixed program; anything you add after the image name
+# (for example "--rps 100 --duration 10") is appended to it as arguments.
+# The target URL comes from the TARGET_URL environment variable.
+ENTRYPOINT ["python", "loadgen.py"]

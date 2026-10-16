@@ -1,6 +1,6 @@
 # Distributed Load Testing Platform: Design Document
 
-**Status:** Draft v0.1
+**Status:** Draft v0.3 (Phases 1 and 2 complete)
 **Author:** Anshul
 **Goal:** Learn system design by building a small distributed load generator with coordination, scaling, and metrics aggregation.
 
@@ -144,6 +144,8 @@ Percentiles cannot be averaged. The p99 of combined data is not the mean of each
 
 **Tradeoff:** Requires measuring per-worker capacity up front. A purely reactive CPU-based scaler is simpler but reacts late and is less predictable.
 
+**Schedule lag as a scaling signal (hypothesis to test in Phase 5):** The generator's *schedule lag* (how far behind its intended send times it is) is a candidate saturation signal. In the native Windows sweep, max lag rose steadily (0, 12, 26 ms at 50, 100, 150 RPS) before jumping above 2 seconds at 200 RPS. The container runs weakened this: max lag was 66 ms at 150 RPS but only 28 ms at 200 RPS, so *max* lag is a noisy statistic that a single hiccup can spike. A smoother measure (95th percentile of lag, or the share of requests sent more than 50 ms late) is likely better. Candidate rule: scale up when that smoother lag measure crosses a threshold. Still untested as an autoscaling signal.
+
 ### 8.4 Redis as the single coordination layer
 **Decision:** Use Redis for registry, commands, and metrics.
 
@@ -178,12 +180,50 @@ Things to measure and document during development:
 
 Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 
+### Measured findings (Phase 1, 2026-10-11)
+
+**Environment:** Windows laptop, Python venv, httpx client, target on the same machine (shared CPU), target at 50 ms nominal latency, 0% errors.
+
+| Target RPS | Achieved send RPS | Max schedule lag | p50 latency | Valid? |
+|-----------|-------------------|------------------|-------------|--------|
+| 50 | 50.1 | 0 ms | 69 ms | Yes |
+| 100 | 100.1 | 12 ms | 67 ms | Yes |
+| 150 | 150.0 | 26 ms | 66 ms | Yes |
+| 200 | 165.3 | 2,097 ms | 704 ms | No (generator behind) |
+
+- **Single-worker ceiling (native Windows):** roughly 150 RPS clean, failing by 200 (httpx, Windows, shared CPU). This was a limit of running natively on Windows, not a general limit; see the container findings below. The earlier provisional planning value of 120 RPS per worker is superseded and must be re-measured in containers.
+- **Cliff, not slope:** lag stayed small, then jumped by two orders of magnitude between 150 and 200 RPS. A plausible mechanism is a feedback loop (falling behind causes bursts of overdue requests, bursts cost CPU, which causes more lag). Not confirmed.
+- **Windows `localhost` pitfall:** using `localhost` instead of `127.0.0.1` cut achieved RPS at the 200 RPS target from 165 to 109 and raised max lag from 2.1 s to 8.3 s. Probable cause is IPv6-first name resolution against an IPv4-only server. Not directly verified.
+- **Why latency was measured from intended send time:** in the failing runs, reported latency (hundreds of ms to seconds) was mostly schedule lag plus delayed response processing in the overloaded event loop, not target latency. A closed-loop generator would have hidden this. Max latency exceeded max lag, so the busy event loop also delays *reading* responses.
+- **Baseline latency offset:** p50 was ~67 ms against a 50 ms nominal target and stayed flat across load levels. The cause is unexplained; one hypothesis is Windows timer granularity in the target's `asyncio.sleep`. In containers p50 was ~56 ms, which is consistent with that hypothesis but not proof, because the generator and the target both moved to Linux at once. A test meant to isolate the target (native generator to containerized target through the published port) was invalid because that path was too slow (see below). Unverified.
+- **Target is a single process:** at higher aggregate RPS it will saturate too, so later results must distinguish generator saturation from target saturation.
+- **Not yet tested:** aiohttp vs. httpx, Windows selector event loop, per-process CPU usage during saturation.
+
+### Measured findings (Phase 2, containers)
+
+**Environment:** Docker Compose on Windows (Docker Desktop). Generator and target each in a container capped at 1 CPU (`cpus: 1.0`), generator reaches the target over the Compose network at `http://target:8000`, target at 50 ms nominal latency unless noted.
+
+| Scenario | Achieved RPS | Max lag | p50 | p99 | Notes |
+|----------|--------------|---------|-----|-----|-------|
+| 100 RPS | 100.1 | 15 ms | 56 ms | 68 ms | Clean |
+| 150 RPS | 150.1 | 66 ms | 57 ms | 128 ms | Lag warning fired; a brief hiccup inflated the tail (p99, max) while p50 and p95 look fine |
+| 200 RPS | 200.1 | 28 ms | 57 ms | 73 ms | Clean. Native Windows failed at this rate |
+| Target at 500 ms, 100 RPS | 100.1 | 56 ms | 508 ms | 607 ms | Open-loop confirmed: RPS held while latency rose about 10x |
+| Cap of 10 in flight, 100 ms, 150 RPS | 150.1 | 26 ms | 93 ms | 126 ms | 38.3% of requests got 503 |
+| Native generator to container via published port, 100 RPS | 72.4 | 3,809 ms | 3,355 ms | 6,316 ms | Invalid (generator far behind) |
+
+- **Container ceiling is above 200 RPS** and has not yet been found. The earlier ~150 RPS figure was specific to native Windows. A plausible reason is Linux's faster event loop and simpler network path, but this is untested.
+- **Do not load test through the published port on Windows.** The generator on the host managed 72 RPS at a 100 RPS target. Probable cause is Docker Desktop's port forwarding overhead; unverified. Run the generator inside the Compose network instead.
+- **The 50 ms lag warning is too sensitive.** It fired on runs where p50 and p95 were trustworthy. A single brief pause delays only the requests scheduled during it, so it inflates p99 and max but not the median.
+- **Load shedding matches theory.** With a cap of 10 and ~100 ms requests, the target can complete at most ~100 requests per second, so at 150 RPS roughly a third or more must be rejected. Observed 38.3%. The Erlang-B loss formula predicts about 41%.
+- **Mixed latency can mislead.** In the cap test, p50 (93 ms) was below the target's 100 ms service time because the fast 503 responses pull the median down. Latency should be reported separately for successful requests and for errors.
+
 ## 11. Implementation Plan
 
 | Phase | Deliverable | Est. time |
 |-------|-------------|-----------|
-| 1 | Single open-loop async load generator with latency recording | 2-3 days |
-| 2 | Dockerize generator; build target service with tunable latency/errors/capacity | 1-2 days |
+| 1 (done) | Single open-loop async load generator with latency recording | 2-3 days |
+| 2 (done) | Dockerize generator; build target service with tunable latency/errors/capacity | 1-2 days |
 | 3 | Coordinator + multiple workers: registry, heartbeats, assignments, synchronized start | 3-4 days |
 | 4 | Histogram-based metric aggregation and live global percentiles | 2-3 days |
 | 5 | Autoscaler using the Docker SDK | 2 days |
@@ -207,10 +247,10 @@ Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 ## 13. Validation Plan
 
 - **Correctness of percentiles:** Compare merged-histogram p99 against p99 computed from raw latency logs on a small run.
-- **Open-loop check:** Slow the target deliberately; confirm the generated RPS stays constant and reported latency rises.
+- **Open-loop check:** Slow the target deliberately; confirm the generated RPS stays constant and reported latency rises. *(Status: done in containers. With the target at 500 ms and a 100 RPS target, achieved RPS was 100.1 and p50 was 508 ms; see Section 10.)*
 - **Scaling test:** Ramp from 100 to 5,000+ RPS and verify the worker count follows the target.
 - **Chaos test:** Kill 1, then 2 workers mid-run; verify detection time and recovery behavior.
-- **Saturation test:** Push one worker past its ceiling; verify the "generator saturated" flag fires.
+- **Saturation test:** Push one worker past its ceiling; verify the "generator saturated" flag fires. *(Status: done for a single worker on 2026-10-11. The warning fired at 200 RPS; see Section 10.)*
 
 ## 14. Demo Scenario
 
@@ -223,7 +263,13 @@ Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 
 ## 15. Open Questions
 
-- What per-worker RPS ceiling is realistic with httpx vs. aiohttp?
+- What is the per-worker ceiling in a container (1 CPU)? It is above 200 RPS with httpx; the 300 to 600 RPS sweep has not been run. Which fails first at high RPS: the generator or the single-process target?
+- aiohttp vs. httpx: does aiohttp raise the ceiling? (Not tested.)
+- Is the feedback-loop explanation for the native-Windows cliff between 150 and 200 RPS correct?
+- Is the extra baseline latency (p50 ~67 ms native, ~56 ms in containers, vs. 50 ms nominal) caused by Windows timer granularity?
+- Will a smoothed per-worker schedule lag (p95 lag or share of late sends) work as an autoscaling signal, and at what threshold?
+- Why is the published-port path so slow on Windows, and does it matter beyond local testing?
+- Report latency for successful requests and for errors separately, so fast 503s don't hide slow successes.
 - Fixed-bucket histogram vs. HdrHistogram vs. t-digest for the metric payload?
 - Should the autoscaler live inside the coordinator or run as its own service?
 - How should ramp profiles interact with scaling lead time (containers take seconds to start)?
@@ -236,6 +282,16 @@ Record the measured per-worker RPS ceiling. The autoscaler depends on it.
 - Designing Data-Intensive Applications (Kleppmann): chapters on replication, partitioning, and stream processing
 - Docker SDK for Python documentation
 - Redis Streams documentation
+
+---
+
+## Revision History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| v0.1 | 2026-10-09 | Initial design |
+| v0.2 | 2026-10-11 | Phase 1 complete. Added measured single-worker findings (Section 10), schedule-lag scaling hypothesis (Section 8.3), validation status (Section 13), and updated open questions (Section 15) |
+| v0.3 | 2026-10-16 | Phase 2 complete. Added container findings (Section 10), corrected the schedule-lag signal (max lag is noisy, Section 8.3) and the native-Windows-only 150 RPS ceiling, marked the open-loop check done (Section 13), updated open questions (Section 15) |
 
 ---
 

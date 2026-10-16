@@ -1,0 +1,35 @@
+# docker-compose.yml - describes the services and how they connect.
+# Compose also creates a private network where each service can be reached
+# by its service name (for example, http://target:8000).
+
+services:
+  target:
+    build:
+      context: .                      # folder sent to Docker as the build input
+      dockerfile: Dockerfile.target
+    ports:
+      - "8000:8000"                   # host port : container port (lets YOU reach it)
+    environment:
+      # ${VAR:-default} reads VAR from your shell, or uses the default.
+      LATENCY_MS: ${LATENCY_MS:-50}
+      ERROR_RATE: ${ERROR_RATE:-0}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-100}
+    cpus: 1.0                         # cap this container at one CPU core
+    healthcheck:                      # how Docker decides the service is ready
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  loadgen:
+    build:
+      context: .
+      dockerfile: Dockerfile.loadgen
+    environment:
+      TARGET_URL: http://target:8000/work   # "target" = the service name above
+    depends_on:
+      target:
+        condition: service_healthy    # wait until the target's healthcheck passes
+    cpus: 1.0
+    profiles: ["loadtest"]            # not started by a plain "docker compose up";
+                                      # you run it on demand instead

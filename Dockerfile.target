@@ -1,0 +1,25 @@
+# Dockerfile.target - builds the image for the test target service.
+
+# Start from an official image that already has Python installed.
+# "slim" is the small variant (no extra tools), which keeps the image small.
+FROM python:3.12-slim
+
+# All following commands run from /app inside the image.
+WORKDIR /app
+
+# Copy ONLY requirements.txt first, then install. Docker caches each step
+# ("layer"). Because requirements.txt rarely changes, the slow pip install
+# is reused on later builds even when you edit your code.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Now copy the code. Editing target.py only re-runs from this step down.
+COPY target.py .
+
+# Documentation only: says this container listens on port 8000.
+EXPOSE 8000
+
+# --host 0.0.0.0 is REQUIRED in a container. The default (127.0.0.1) means
+# "only accept connections from inside this same container", so nothing
+# else, including other containers or your browser, could reach it.
+CMD ["uvicorn", "target:app", "--host", "0.0.0.0", "--port", "8000"]

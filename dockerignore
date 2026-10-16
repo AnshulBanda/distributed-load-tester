@@ -1,0 +1,11 @@
+# Files Docker should NOT send as build input. Keeps builds fast and
+# stops your virtual environment and git history from being copied in.
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+docs/
+*.md
+.env
