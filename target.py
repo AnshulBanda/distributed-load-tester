@@ -43,3 +43,7 @@ async def work():
         return {"ok": True}
     finally:
         inflight -= 1
+
+@app.get("/health")
+async def health():
+    return {"status": "up"}
